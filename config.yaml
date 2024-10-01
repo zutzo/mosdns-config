@@ -1,0 +1,245 @@
+log:
+  level: error
+  file: "./mosdns.log"
+
+# API入口设置
+api:
+  http: "0.0.0.0:9091"
+
+include: []
+
+plugins:
+  # 国内域名 https://raw.githubusercontent.com/pmkol/easymosdns/rules/china_domain_list.txt
+  - tag: geosite_cn
+    type: domain_set
+    args:
+      files:
+        - "./rules/geosite_cn.txt"
+
+  # 国内IP https://raw.githubusercontent.com/pmkol/easymosdns/rules/china_ip_list.txt
+  - tag: geoip_cn
+    type: ip_set
+    args:
+      files:
+        - "./rules/geoip_cn.txt"
+
+  # 代理域名 https://raw.githubusercontent.com/pmkol/easymosdns/rules/gfw_domain_list.txt
+  - tag: geosite_non_cn
+    type: domain_set
+    args:
+      files:
+        - "./rules/geosite_geolocation-!cn.txt"
+
+  # 苹果域名 https://raw.githubusercontent.com/pmkol/easymosdns/rules/cdn_domain_list.txt
+  - tag: geosite_apple
+    type: domain_set
+    args:
+      files:
+        - "./rules/geosite_apple.txt"
+
+  # 加速域名 指定本地请求的域名加入 whitelist.txt
+  - tag: whitelist
+    type: domain_set
+    args:
+      files:
+        - "./rules/whitelist.txt"
+
+  # PTR域名
+  - tag: local_ptr
+    type: domain_set
+    args:
+      files:
+        - "./rules/local-ptr.txt"
+
+  # Hosts
+  - tag: hosts
+    type: hosts
+    args:
+      files:
+        - "./rules/hosts.txt"
+
+  # 屏蔽域名
+  - tag: blocklist
+    type: domain_set
+    args:
+      files:
+        - "./rules/reject.txt"
+        
+  # 缓存
+  - tag: lazy_cache
+    type: cache
+    args:
+      size: 8192
+      lazy_cache_ttl: 86400
+      dump_file: "./cache.dump"
+      dump_interval: 1800
+
+  # 转发至默认运营商服务器
+  - tag: forward_local
+    type: forward
+    args:
+      upstreams:
+        - addr: "223.5.5.5:53"
+        - addr: "192.168.1.1:53"
+        - addr: "180.184.1.1:53"        
+        
+
+  # 转发至备用无污染服务器
+  - tag: forward_local_backup
+    type: forward
+    args:
+      upstreams:
+        - addr: "https://doh.apad.pro/dns-query"
+          bootstrap: "223.6.6.6"
+          enable_http3: true
+          idle_timeout: 60
+
+  # 转发至默认无污染服务器
+  - tag: forward_remote
+    type: forward
+    args:
+      upstreams:
+        - addr: "https://doh.apad.pro/dns-query"
+          bootstrap: "223.6.6.6"
+          enable_http3: true
+          idle_timeout: 60
+
+  # 转发至备用无污染服务器
+  - tag: forward_remote_backup
+    type: forward
+    args:
+      upstreams:
+        - addr: "tls://8.8.8.8:853"
+          enable_pipeline: true
+          idle_timeout: 60
+
+  # 本地解析
+  - tag: local_sequence
+    type: sequence
+    args:
+      - exec: $forward_local
+      - matches: "!has_wanted_ans"
+        exec: drop_resp
+  - tag: local_backup_sequence
+    type: sequence
+    args:
+      - exec: $forward_local_backup
+      - matches: "!has_wanted_ans"
+        exec: drop_resp
+  - tag: local_fallback
+    type: fallback
+    args:
+      primary: local_sequence
+      secondary: local_backup_sequence
+      threshold: 50
+      always_standby: false
+
+  # 远程解析
+  - tag: remote_sequence
+    type: sequence
+    args:
+      - exec: $forward_remote
+  - tag: remote_backup_sequence
+    type: sequence
+    args:
+      - exec: $forward_remote_backup
+  - tag: remote_fallback
+    type: fallback
+    args:
+      primary: remote_sequence
+      secondary: remote_backup_sequence
+      threshold: 500
+      always_standby: false
+
+  # 分流解析
+  - tag: local_remote_fallback
+    type: sequence
+    args:
+      - exec: $local_fallback
+      - matches: "!resp_ip $geoip_cn"
+        exec: $remote_fallback
+
+  # 有响应终止返回
+  - tag: has_resp_sequence
+    type: sequence
+    args:
+      - matches: has_resp
+        exec: accept
+
+  # 查询国内域名
+  - tag: query_is_local_domain
+    type: sequence
+    args:
+      - matches: qname $geosite_cn
+        exec: $local_fallback
+
+  # 查询国外域名
+  - tag: query_is_no_local_domain
+    type: sequence
+    args:
+      - matches: qname $geosite_non_cn
+        exec: $remote_fallback
+
+  # 查询苹果域名
+  - tag: query_is_apple_domain
+    type: sequence
+    args:
+      - matches: qname $geosite_apple
+        exec: $local_remote_fallback
+
+  # 查询加速域名
+  - tag: query_is_whitelist_domain
+    type: sequence
+    args:
+      - matches: qname $geosite_apple
+        exec: $local_fallback
+
+  # 查询屏蔽域名
+  - tag: query_is_reject_domain
+    type: sequence
+    args:
+      - matches: qname $blocklist
+        exec: reject 3
+      - matches:
+          - qtype 12
+          - qname $local_ptr
+        exec: reject 3
+
+  # 主要的运行逻辑插件
+  # sequence 插件中调用的插件 tag 必须在 sequence 前定义，否则 sequence 找不到对应插件
+  - tag: main_sequence
+    type: sequence
+    args:
+      - exec: $hosts
+      - matches:
+          - "!qname $blocklist"
+          - "!qname $local_ptr"
+        exec: $lazy_cache
+      - exec: $query_is_whitelist_domain
+      - exec: jump has_resp_sequence
+      - exec: $query_is_apple_domain
+      - exec: jump has_resp_sequence
+      - exec: $query_is_reject_domain
+      - exec: jump has_resp_sequence
+      - exec: $query_is_local_domain
+      - exec: jump has_resp_sequence
+      # 启用本地分流请取消下方前3行注释并注释下方第4行
+      #- exec: $query_is_no_local_domain
+      #- exec: jump has_resp_sequence
+      #- exec: $local_remote_fallback
+      - exec: $remote_fallback
+      - exec: query_summary local
+
+  # 启动 udp 服务器。
+  - tag: udp_server
+    type: udp_server
+    args:
+      entry: main_sequence
+      listen: ":5335"
+
+  # 启动 tcp 服务器。
+  - tag: tcp_server
+    type: tcp_server
+    args:
+      entry: main_sequence
+      listen: ":5335"
